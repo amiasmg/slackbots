@@ -26,12 +26,14 @@ def _serialize(result: dict) -> str:
     return text
 
 
-def run_agent(client, cfg: Config, message: str, url_hints: list = (), context: str = "") -> AgentResult:
+def run_agent(client, cfg: Config, message: str, url_hints: list = (), context: str = "", poster: str = "") -> AgentResult:
     """Tool-calling loop. `client` is an anthropic.Anthropic (or a test double)."""
     parts = []
     if context:
         parts.append(f"Thread context:\n{context}")
     parts.append(f"Slack message:\n{message}")
+    if poster:
+        parts.append(f"Posted by: {poster}")
     if url_hints:
         parts.append("URLs detected (normalised): " + ", ".join(u["url"] for u in url_hints))
     messages = [{"role": "user", "content": "\n\n".join(parts)}]

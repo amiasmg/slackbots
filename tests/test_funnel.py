@@ -102,3 +102,57 @@ def test_no_reply_is_silent():
     client = NS(messages=NS(create=lambda **kw: NS(stop_reason="end_turn",
                                                    content=[NS(type="text", text="NO_REPLY")])))
     assert run_agent(client, CFG, "lunch?").silent
+
+
+def _routes_with_list(extra=None):
+    r = {("GET", "/lists/7"): FakeResp(200, {"fields": [
+        {"id": 1, "name": "Stage", "dropdown_options": [{"id": 11, "text": "Intro"}, {"id": 12, "text": "Diligence"}]},
+        {"id": 2, "name": "Owners", "dropdown_options": []}]})}
+    r.update(extra or {})
+    return r
+
+
+def test_set_stage_resolves_dropdown_text_and_replaces(monkeypatch):
+    calls = patch_requests(monkeypatch, _routes_with_list({
+        ("GET", "/field-values"): FakeResp(200, [{"id": 99, "field_id": 1, "value": {"id": 11}}]),
+        ("PUT", "/field-values/99"): FakeResp(200, {})}))
+    out = affinity.affinity_set_list_entry_field(CFG, 3, 5, "stage", "Diligence")
+    assert out["changed"] and ("PUT", "https://api.affinity.co/field-values/99") in calls
+
+
+def test_set_stage_rejects_unknown_option(monkeypatch):
+    patch_requests(monkeypatch, _routes_with_list())
+    out = affinity.affinity_set_list_entry_field(CFG, 3, 5, "Stage", "Nonsense")
+    assert out["status"] == "request_error" and "Intro" in out["message"]
+
+
+def test_owner_add_is_noop_when_present_and_appends_otherwise(monkeypatch):
+    patch_requests(monkeypatch, _routes_with_list({
+        ("GET", "/field-values"): FakeResp(200, [{"id": 1, "field_id": 2, "value": 42}])}))
+    assert affinity.affinity_set_list_entry_field(CFG, 3, 5, "Owners", 42, "add")["already_set"]
+    calls = patch_requests(monkeypatch, _routes_with_list({
+        ("GET", "/field-values"): FakeResp(200, [{"id": 1, "field_id": 2, "value": 42}]),
+        ("POST", "/field-values"): FakeResp(200, {})}))
+    assert affinity.affinity_set_list_entry_field(CFG, 3, 5, "Owners", 43, "add")["changed"]
+    assert any(m == "POST" for m, _ in calls)
+
+
+def test_note_is_deduplicated(monkeypatch):
+    marker = "[funnel:slack_post:" + __import__("hashlib").sha1(b"hi").hexdigest()[:10] + "]"
+    calls = patch_requests(monkeypatch, {("GET", "/notes"): FakeResp(200, {"notes": [
+        {"created_at": "2026-01-01", "content": f"hi\n\n{marker}"}]})})
+    out = affinity.affinity_create_note(CFG, 5, "hi", "slack_post")
+    assert out["duplicate"] and not any(m == "POST" for m, _ in calls)
+
+
+def test_link_person_does_not_invent_people(monkeypatch):
+    patch_requests(monkeypatch, {("GET", "/persons"): FakeResp(200, {"persons": []})})
+    out = affinity.affinity_link_person(CFG, "x@acme.com", 5)
+    assert out["status"] == "empty" and "first_name" in out["message"]
+
+
+def test_link_person_attaches_existing(monkeypatch):
+    calls = patch_requests(monkeypatch, {
+        ("GET", "/persons"): FakeResp(200, {"persons": [{"id": 8, "emails": ["X@acme.com"], "organization_ids": []}]}),
+        ("PUT", "/persons/8"): FakeResp(200, {})})
+    assert affinity.affinity_link_person(CFG, "x@acme.com", 5)["linked"]

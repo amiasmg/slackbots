@@ -21,9 +21,20 @@ def build_app(cfg, client=None):
     my_user, my_bot = me["user_id"], me.get("bot_id")
     seen = set()  # Slack can redeliver events
 
-    def handle(text, channel, thread_ts, context=""):
+    def poster_of(user_id):
+        """'Name <email>' for the Slack author, so the agent can map them to an Affinity person."""
+        if not user_id:
+            return "(bot/integration - no owner)"
         try:
-            result = run_agent(llm, cfg, text, extract_company_urls(text), context)
+            prof = app.client.users_info(user=user_id)["user"]
+            return f"{prof.get('real_name') or prof.get('name')} <{prof.get('profile', {}).get('email', 'no email')}>"
+        except Exception as exc:  # missing users:read.email scope etc. - degrade, don't fail
+            log.warning("could not resolve poster %s: %s", user_id, exc)
+            return "(unknown poster - no owner)"
+
+    def handle(text, channel, thread_ts, context="", poster=""):
+        try:
+            result = run_agent(llm, cfg, text, extract_company_urls(text), context, poster)
             log.info("tools=%s", result.tool_calls)
             if not result.silent:
                 app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=result.text)
@@ -43,7 +54,7 @@ def build_app(cfg, client=None):
         if event.get("thread_ts") not in (None, ts) or (event["channel"], ts) in seen:
             return  # thread replies are handled via @mention
         seen.add((event["channel"], ts))
-        handle(event.get("text", ""), event["channel"], ts)
+        handle(event.get("text", ""), event["channel"], ts, poster=poster_of(event.get("user")))
 
     @app.event("app_mention")
     def on_mention(event):
@@ -51,7 +62,7 @@ def build_app(cfg, client=None):
         replies = app.client.conversations_replies(channel=event["channel"], ts=thread, limit=20)
         context = "\n".join(m.get("text", "") for m in replies.get("messages", []) if m["ts"] != event["ts"])
         text = re.sub(rf"<@{my_user}>", "", event.get("text", "")).strip()
-        handle(text, event["channel"], thread, context)
+        handle(text, event["channel"], thread, context, poster_of(event.get("user")))
 
     return app
 

@@ -3,6 +3,7 @@
 ASSUMPTION: v1 endpoints (organizations, lists/{id}/list-entries, notes, interactions).
 Interactions return metadata (date, subject, participants), not email bodies.
 """
+import hashlib
 from datetime import datetime, timedelta, timezone
 
 from .base import api_call, empty, error, ok
@@ -144,3 +145,129 @@ def affinity_get_interactions(cfg, organization_id: int, kind: str, since_days: 
          "persons": [p.get("first_name", "") + " " + p.get("last_name", "")
                      for p in (i.get("persons") or [])][:8]}
         for i in items[:MAX_ITEMS]])
+
+
+# ---- people, notes and pipeline fields (stage / owners) -------------------------------
+
+def affinity_find_person(cfg, email: str) -> dict:
+    if (e := _check(cfg)):
+        return e
+    res = api_call("Affinity", "GET", f"{BASE}/persons", params={"term": email}, auth=_auth(cfg))
+    if res["status"] != "ok":
+        return res
+    people = (res["data"] or {}).get("persons") if isinstance(res["data"], dict) else None
+    if people is None:
+        return error("bad_response", "Affinity /persons had no 'persons' field")
+    exact = [p for p in people if email.lower() in [x.lower() for x in (p.get("emails") or [])]]
+    if not exact:
+        return empty(f"No Affinity person with email {email}")
+    p = exact[0]
+    return ok(id=p["id"], name=f"{p.get('first_name', '')} {p.get('last_name', '')}".strip(),
+              organization_ids=p.get("organization_ids") or [])
+
+
+def affinity_link_person(cfg, email: str, organization_id: int,
+                         first_name: str = "", last_name: str = "") -> dict:
+    """Ensure a contact is attached to the company. Creates the person only if both names are given."""
+    found = affinity_find_person(cfg, email)
+    if found["status"] == "ok":
+        if organization_id in found["organization_ids"]:
+            return ok(linked=False, already_linked=True, person_id=found["id"])
+        if cfg.dry_run:
+            return {"status": "dry_run", "message": f"Would link person {found['id']} to org {organization_id}"}
+        res = api_call("Affinity", "PUT", f"{BASE}/persons/{found['id']}", auth=_auth(cfg),
+                       json={"organization_ids": found["organization_ids"] + [organization_id]})
+        return ok(linked=True, person_id=found["id"]) if res["status"] == "ok" else res
+    if found["status"] != "empty":
+        return found
+    if not (first_name and last_name):
+        return empty(f"{email} is not in Affinity; give first_name and last_name to create them")
+    if cfg.dry_run:
+        return {"status": "dry_run", "message": f"Would create {first_name} {last_name} <{email}>"}
+    res = api_call("Affinity", "POST", f"{BASE}/persons", auth=_auth(cfg), json={
+        "first_name": first_name, "last_name": last_name, "emails": [email],
+        "organization_ids": [organization_id]})
+    return ok(linked=True, created=True, person_id=res["data"].get("id")) if res["status"] == "ok" else res
+
+
+def affinity_create_note(cfg, organization_id: int, content: str, kind: str) -> dict:
+    """Idempotent via a content-hash marker, so Slack redeliveries don't duplicate notes."""
+    if (e := _check(cfg)):
+        return e
+    marker = f"[funnel:{kind}:{hashlib.sha1(content.encode()).hexdigest()[:10]}]"
+    existing = affinity_get_notes(cfg, organization_id)
+    if existing["status"] not in ("ok", "empty"):
+        return existing
+    if existing["status"] == "ok" and any(marker in (n["content"] or "") for n in existing["notes"]):
+        return ok(created=False, duplicate=True)
+    if cfg.dry_run:
+        return {"status": "dry_run", "message": f"Would create '{kind}' note on org {organization_id}"}
+    res = api_call("Affinity", "POST", f"{BASE}/notes", auth=_auth(cfg),
+                   json={"organization_ids": [organization_id], "content": f"{content}\n\n{marker}"})
+    return ok(created=True, note_id=res["data"].get("id")) if res["status"] == "ok" else res
+
+
+def _list_fields(cfg):
+    res = api_call("Affinity", "GET", f"{BASE}/lists/{cfg.affinity_list_id}", auth=_auth(cfg))
+    if res["status"] != "ok":
+        return None, res
+    fields = (res["data"] or {}).get("fields")
+    if fields is None:
+        return None, error("bad_response", "Affinity list response had no 'fields'")
+    return fields, None
+
+
+def affinity_get_list_fields(cfg) -> dict:
+    """Pipeline columns (e.g. Stage, Owners) with dropdown options, so the agent can pick valid values."""
+    if (e := _check(cfg)):
+        return e
+    fields, err = _list_fields(cfg)
+    if err:
+        return err
+    return ok(fields=[{"name": f.get("name"), "value_type": f.get("value_type"),
+                       "allows_multiple": f.get("allows_multiple"),
+                       "options": [o.get("text") for o in f.get("dropdown_options") or []]}
+                      for f in fields])
+
+
+def _plain(v):
+    return v.get("id") if isinstance(v, dict) else v
+
+
+def affinity_set_list_entry_field(cfg, list_entry_id: int, organization_id: int,
+                                  field_name: str, value, mode: str = "replace") -> dict:
+    """Set a pipeline column. Dropdowns take the option text; person columns take a person id.
+    mode 'replace' overwrites a single value (Stage); 'add' appends without removing (Owners)."""
+    if (e := _check(cfg)):
+        return e
+    fields, err = _list_fields(cfg)
+    if err:
+        return err
+    field = next((f for f in fields if (f.get("name") or "").lower() == field_name.lower()), None)
+    if not field:
+        return error("request_error", f"No pipeline column '{field_name}'. Columns: "
+                     f"{[f.get('name') for f in fields]}")
+    opts = field.get("dropdown_options") or []
+    if opts:
+        match = next((o for o in opts if (o.get("text") or "").lower() == str(value).lower()), None)
+        if not match:
+            return error("request_error", f"'{value}' is not an option for {field_name}: "
+                         f"{[o.get('text') for o in opts]}")
+        value = match["id"]
+    cur = api_call("Affinity", "GET", f"{BASE}/field-values",
+                   params={"list_entry_id": list_entry_id}, auth=_auth(cfg))
+    if cur["status"] != "ok":
+        return cur
+    same = [v for v in cur["data"] if v.get("field_id") == field["id"]] if isinstance(cur["data"], list) else []
+    if any(_plain(v.get("value")) == value for v in same):
+        return ok(changed=False, already_set=True)
+    if cfg.dry_run:
+        return {"status": "dry_run", "message": f"Would set {field_name}={value} on entry {list_entry_id}"}
+    if same and mode == "replace":
+        res = api_call("Affinity", "PUT", f"{BASE}/field-values/{same[0]['id']}",
+                       json={"value": value}, auth=_auth(cfg))
+    else:
+        res = api_call("Affinity", "POST", f"{BASE}/field-values", auth=_auth(cfg), json={
+            "field_id": field["id"], "entity_id": organization_id,
+            "list_entry_id": list_entry_id, "value": value})
+    return ok(changed=True) if res["status"] == "ok" else res
