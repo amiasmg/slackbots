@@ -4,4 +4,6 @@
 - Never hardcode/print/commit secrets (`.env`). Load from env via `funnel/config.py`.
 - Surface auth/request/empty/shape failures distinctly; never collapse them into empty results.
 - Write tools must honour `cfg.dry_run` and be idempotent in code, not left to the prompt.
+- New intake channels produce a `funnel.models.Inbound`; do not add channel-specific logic to the agent or tools.
+- Paid lookups (Specter, Pitchbook) go through `base.cached`.
 - Add a test in `tests/` for each tool or behaviour change; run `python3 -m pytest`.

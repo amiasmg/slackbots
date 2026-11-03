@@ -4,6 +4,11 @@ Every tool returns a dict with a `status` so the agent (and logs) can tell apart
 ok, empty (valid empty result), auth_error, request_error, bad_response,
 not_configured, dry_run.
 """
+import hashlib
+import json
+import os
+import time
+
 import requests
 
 TIMEOUT = 30
@@ -21,8 +26,8 @@ def error(kind: str, message: str) -> dict:
     return {"status": kind, "message": message}
 
 
-def api_call(service: str, method: str, url: str, **kwargs) -> dict:
-    """Return ok(data=<json>) or an error dict; never raises."""
+def api_call(service: str, method: str, url: str, raw: bool = False, **kwargs) -> dict:
+    """Return ok(data=<json>) (or ok(content=<bytes>) when raw) or an error dict; never raises."""
     try:
         resp = requests.request(method, url, timeout=TIMEOUT, **kwargs)
     except requests.RequestException as exc:
@@ -33,7 +38,31 @@ def api_call(service: str, method: str, url: str, **kwargs) -> dict:
         return error("request_error", f"{service} rate limited (HTTP 429)")
     if not resp.ok:
         return error("request_error", f"{service} HTTP {resp.status_code}: {resp.text[:300]}")
+    if raw:
+        return ok(content=resp.content, content_type=resp.headers.get("content-type", ""))
     try:
         return ok(data=resp.json())
     except ValueError:
         return error("bad_response", f"{service} returned non-JSON: {resp.text[:200]}")
+
+
+def cached(cfg, key: str, fn):
+    """File cache for paid lookups (Specter/Pitchbook bill per call). Only successful results are kept."""
+    if not cfg.cache_dir:
+        return fn()
+    path = os.path.join(cfg.cache_dir, hashlib.sha1(key.encode()).hexdigest() + ".json")
+    try:
+        if time.time() - os.path.getmtime(path) < cfg.cache_ttl_hours * 3600:
+            with open(path) as f:
+                return {**json.load(f), "cached": True}
+    except (OSError, ValueError):
+        pass
+    result = fn()
+    if result.get("status") == "ok":
+        try:
+            os.makedirs(cfg.cache_dir, exist_ok=True)
+            with open(path, "w") as f:
+                json.dump(result, f, default=str)
+        except OSError:
+            pass  # a cache write failure must never fail the lookup
+    return result

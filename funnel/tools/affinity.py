@@ -4,6 +4,7 @@ ASSUMPTION: v1 endpoints (organizations, lists/{id}/list-entries, notes, interac
 Interactions return metadata (date, subject, participants), not email bodies.
 """
 import hashlib
+import io
 from datetime import datetime, timedelta, timezone
 
 from .base import api_call, empty, error, ok
@@ -115,7 +116,8 @@ def affinity_get_notes(cfg, organization_id: int) -> dict:
          "content": (n.get("content") or "")[:2000]} for n in notes])
 
 
-def affinity_get_interactions(cfg, organization_id: int, kind: str, since_days: int = 730) -> dict:
+def affinity_get_interactions(cfg, organization_id: int, kind: str, since_days: int = 730,
+                              person_id: int = 0) -> dict:
     """kind: meetings | calls | emails. Newest first, capped at 100, windowed to <=1 year per call."""
     if (e := _check(cfg)):
         return e
@@ -127,7 +129,8 @@ def affinity_get_interactions(cfg, organization_id: int, kind: str, since_days: 
     while end > floor and len(items) < MAX_ITEMS:
         start = max(end - timedelta(days=365), floor)
         res = api_call("Affinity", "GET", f"{BASE}/interactions", auth=_auth(cfg), params={
-            "type": INTERACTION_TYPES[kind], "organization_id": organization_id,
+            "type": INTERACTION_TYPES[kind],
+            **({"person_id": person_id} if person_id else {"organization_id": organization_id}),
             "start_time": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "end_time": end.strftime("%Y-%m-%dT%H:%M:%SZ"), "page_size": MAX_ITEMS})
         if res["status"] != "ok":
@@ -271,3 +274,118 @@ def affinity_set_list_entry_field(cfg, list_entry_id: int, organization_id: int,
             "field_id": field["id"], "entity_id": organization_id,
             "list_entry_id": list_entry_id, "value": value})
     return ok(changed=True) if res["status"] == "ok" else res
+
+
+# ---- CRM depth: people, files, uploads -----------------------------------------------
+
+MAX_PEOPLE = 25
+MAX_FILE_CHARS = 15000
+
+
+def affinity_company_people(cfg, organization_id: int) -> dict:
+    """People Affinity has at the company (to spot the CEO/founders), with their emails."""
+    if (e := _check(cfg)):
+        return e
+    org = api_call("Affinity", "GET", f"{BASE}/organizations/{organization_id}", auth=_auth(cfg))
+    if org["status"] != "ok":
+        return org
+    ids = (org["data"] or {}).get("person_ids") or []
+    if not ids:
+        return empty("Affinity has no people attached to this company")
+    people, errors = [], []
+    for pid in ids[:MAX_PEOPLE]:
+        res = api_call("Affinity", "GET", f"{BASE}/persons/{pid}", auth=_auth(cfg))
+        if res["status"] != "ok":
+            errors.append(res)
+            continue
+        p = res["data"]
+        people.append({"id": p["id"], "name": f"{p.get('first_name', '')} {p.get('last_name', '')}".strip(),
+                       "emails": p.get("emails") or []})
+    return ok(people=people, truncated=len(ids) > MAX_PEOPLE, errors=errors)
+
+
+def affinity_find_internal_user(cfg, name: str) -> dict:
+    """Resolve a teammate's name (e.g. a partner mentioned in the message) to an Affinity person id."""
+    if (e := _check(cfg)):
+        return e
+    res = api_call("Affinity", "GET", f"{BASE}/persons", params={"term": name}, auth=_auth(cfg))
+    if res["status"] != "ok":
+        return res
+    people = (res["data"] or {}).get("persons") if isinstance(res["data"], dict) else None
+    if people is None:
+        return error("bad_response", "Affinity /persons had no 'persons' field")
+    internal = [p for p in people if p.get("type") == 1]  # 1 = internal (your firm's users)
+    if not internal:
+        return empty(f"No internal Affinity user matching '{name}'")
+    return ok(matches=[{"id": p["id"], "name": f"{p.get('first_name', '')} {p.get('last_name', '')}".strip(),
+                        "emails": p.get("emails") or []} for p in internal[:5]],
+              ambiguous=len(internal) > 1)
+
+
+def affinity_list_files(cfg, organization_id: int) -> dict:
+    if (e := _check(cfg)):
+        return e
+    res = api_call("Affinity", "GET", f"{BASE}/entity-files", auth=_auth(cfg),
+                   params={"organization_id": organization_id, "page_size": MAX_ITEMS})
+    if res["status"] != "ok":
+        return res
+    files = (res["data"] or {}).get("entity_files") if isinstance(res["data"], dict) else None
+    if files is None:
+        return error("bad_response", "Affinity /entity-files had no 'entity_files' field")
+    if not files:
+        return empty("No files on this company")
+    files.sort(key=lambda f: f.get("created_at") or "", reverse=True)
+    return ok(files=[{"id": f["id"], "name": f.get("name"), "size": f.get("size"),
+                      "created_at": f.get("created_at")} for f in files])
+
+
+def _extract_text(content: bytes, content_type: str, name: str) -> dict:
+    lower = (name or "").lower()
+    if lower.endswith(".pdf") or "pdf" in content_type:
+        try:
+            from pypdf import PdfReader
+
+            pages = PdfReader(io.BytesIO(content)).pages
+            text = "\n".join((p.extract_text() or "") for p in pages[:40])
+        except Exception as exc:
+            return error("bad_response", f"Could not read PDF: {exc}")
+        if not text.strip():
+            return empty("PDF has no extractable text (likely scanned or image-only)")
+        return ok(text=text[:MAX_FILE_CHARS], truncated=len(text) > MAX_FILE_CHARS, pages=len(pages))
+    if lower.endswith((".txt", ".md", ".csv")) or content_type.startswith("text/"):
+        text = content.decode("utf-8", errors="replace")
+        return ok(text=text[:MAX_FILE_CHARS], truncated=len(text) > MAX_FILE_CHARS)
+    return error("unsupported", f"Cannot read {name or 'this file'} ({content_type or 'unknown type'}); only PDF/text")
+
+
+def affinity_read_file(cfg, file_id: int, name: str = "") -> dict:
+    """Download a CRM file and return its text (PDF/text only). Use for decks, memos, model summaries."""
+    if (e := _check(cfg)):
+        return e
+    res = api_call("Affinity", "GET", f"{BASE}/entity-files/download/{file_id}", auth=_auth(cfg), raw=True)
+    if res["status"] != "ok":
+        return res
+    return _extract_text(res["content"], res["content_type"], name)
+
+
+def affinity_attach_inbound_file(cfg, ctx, organization_id: int, attachment_index: int) -> dict:
+    """File an attachment from the inbound message/email on the company. Skips if already there."""
+    if (e := _check(cfg)):
+        return e
+    atts = getattr(ctx, "attachments", None) or []
+    if not 0 <= attachment_index < len(atts):
+        return error("request_error", f"attachment_index must be 0..{len(atts) - 1}" if atts
+                     else "This message has no attachments")
+    att = atts[attachment_index]
+    existing = affinity_list_files(cfg, organization_id)
+    if existing["status"] not in ("ok", "empty"):
+        return existing
+    if existing["status"] == "ok" and any(f["name"] == att.filename and f.get("size") == len(att.data)
+                                          for f in existing["files"]):
+        return ok(uploaded=False, already_filed=True, filename=att.filename)
+    if cfg.dry_run:
+        return {"status": "dry_run", "message": f"Would file {att.filename} on org {organization_id}"}
+    res = api_call("Affinity", "POST", f"{BASE}/entity-files", auth=_auth(cfg),
+                   data={"organization_id": organization_id},
+                   files={"file": (att.filename, att.data, att.content_type)})
+    return ok(uploaded=True, filename=att.filename) if res["status"] == "ok" else res

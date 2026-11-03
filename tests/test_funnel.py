@@ -8,8 +8,9 @@ from funnel.tools.urls import extract_company_urls
 
 
 class FakeResp:
-    def __init__(self, code=200, data=None, text=""):
+    def __init__(self, code=200, data=None, text="", content=b"", headers=None):
         self.status_code, self._data, self.text = code, data, text
+        self.content, self.headers = content, headers or {}
         self.ok = code < 400
 
     def json(self):
@@ -56,10 +57,10 @@ def test_pitchbook_distinguishes_auth_from_empty(monkeypatch):
 def test_pitchbook_partial_failure_is_reported(monkeypatch):
     patch_requests(monkeypatch, {
         ("GET", "/companies/search"): FakeResp(200, {"items": [{"companyId": "1-A"}]}),
-        ("GET", "/companies/1-A/bio"): FakeResp(200, {"description": "x"}),
+        ("GET", "/companies/1-A/deals"): FakeResp(200, [{"size": 5}]),
         ("GET", "/companies/1-A/investors"): FakeResp(500, text="boom")})
     out = pitchbook.pitchbook_lookup(CFG, "acme.com")
-    assert out["status"] == "ok" and out["bio"] and out["errors"][0]["section"] == "investors"
+    assert out["status"] == "ok" and out["deals"] and out["errors"][0]["section"] == "investors"
 
 
 def test_add_to_pipeline_is_idempotent(monkeypatch):
@@ -88,7 +89,7 @@ def test_tool_crash_is_contained(monkeypatch):
 
 
 def test_agent_loop_runs_tools_then_answers(monkeypatch):
-    monkeypatch.setattr("funnel.agent.execute", lambda cfg, n, a: {"status": "empty", "message": "none"})
+    monkeypatch.setattr("funnel.agent.execute", lambda cfg, n, a, ctx=None: {"status": "empty", "message": "none"})
     steps = iter([
         NS(stop_reason="tool_use", content=[NS(type="tool_use", id="t1", name="affinity_find_company",
                                                input={"domain": "acme.com"})]),

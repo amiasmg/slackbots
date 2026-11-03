@@ -3,3 +3,4 @@ anthropic==2.3.0
 requests==2.32.3
 python-dotenv==1.0.0
 pytest==8.3.4
+pypdf==6.21.4

@@ -1,31 +1,25 @@
 # slackbots
 
-Top-of-funnel pipeline agent. Replaces three Zaps (*Top of Funnel => Deal Pipeline*, *Pitchbook summary*, *Summarize Previous Interactions*) with one Slack bot that uses Claude with tool-calling.
+Top-of-funnel pipeline agent. When a team member posts a company URL in `#top-of-funnel-pipeline`, or forwards an email (often with a deck) to `qed.topfunnel@qedinvestors.com`, the bot runs three tasks and posts one summary. It replaces the old Zaps (*Top of Funnel => Deal Pipeline*, *Pitchbook summary*, *Summarize Previous Interactions*).
 
-Someone posts a company URL in `#top-of-funnel-pipeline`; the bot replies in-thread with: pipeline status (adds to Affinity if missing), a Pitchbook/Specter snapshot, and a summary of prior notes/meetings/emails. `@mention` it in a thread for follow-ups.
+## What it does
+
+1. **Quick research**: Pitchbook (leading investors, total raised, last round), Specter (momentum, hiring), and open-web search (what they do, customers, team bios).
+2. **CRM history** (Affinity): do we know the CEO, when did we last speak, notes/files from those meetings, and what they projected then.
+3. **Pipeline**: add to the deal pipeline if missing with Stage = `Watchlist`, add any teammate mentioned in the message as Owner, save the original message and the research as Affinity notes, and file attachments on the company.
+
+PDFs (Slack uploads or email attachments) are read by Claude directly, which is also how the company URL is found when the message has none.
 
 ## Design
 
-Code does what must be deterministic; the model decides what to do and writes the summary.
+Code does what must be deterministic or safe; the model decides what to do and writes the summary.
 
-| Old zap step | Now |
-|---|---|
-| Filters (bot name, "text exists", "URL exists") | Loop guard on own messages in `app.py`; model replies `NO_REPLY` to chatter |
-| GPT "fix doubled URL" + Formatter "Extract URL" | `tools/urls.py` (tested) |
-| Pitchbook code steps (search, bio, investors) | `tools/pitchbook.py`; partial failures reported, not swallowed |
-| Affinity find org / "ping Affinity API" x3 | `tools/affinity.py` (find, pipeline status, notes, interactions) |
-| Add to pipeline if absent (Path A/B: already in list vs. add) | `affinity_add_to_pipeline` re-checks membership in code, so one call covers both paths and is idempotent |
-| GPT extracts company name, stage, founder emails; Python parses emails | The model reads the message directly; `affinity_get_list_fields` gives it the valid Stage options |
-| Affinity "Get Person ID based on Slack" | `app.py` resolves the poster's Slack email; agent calls `affinity_find_person` |
-| Loop over emails: find person | `affinity_link_person` (finds, attaches to company; creates only if a name is given) |
-| "Update stage and Owners" | `affinity_set_list_entry_field` (Stage replaces, Owners appends; never wipes existing owners) |
-| "Create a Note" (Slack post; Pitchbook summary) | `affinity_create_note`, duplicate-safe via a content-hash marker |
-| Google Sheet to batch emails for LLM, "Ask Gemini" | Removed: interactions are trimmed/capped in code and summarised in-context |
-| Paths (has history / no history) | Model branches itself ("first touch") |
-
-Every tool returns a `status` of `ok`, `empty`, `auth_error`, `request_error`, `bad_response`, `not_configured` or `dry_run`, so a broken key is never reported as "company not found".
-
-Extending: write a function in `funnel/tools/`, add one `Tool(...)` entry in `funnel/tools/__init__.py`, adjust `prompts.py` if behaviour should change.
+- **Intake is pluggable.** Slack, a Graph mailbox poller and a webhook all produce one `Inbound` object (`funnel/models.py`) for the same agent.
+- **Tools** live in `funnel/tools/`; add one function and one `Tool(...)` entry in `funnel/tools/__init__.py`.
+- **Idempotent writes in code**: pipeline add, notes (content-hash marker), file upload, owners (append-only), stage (only set on newly added companies, enforced by the prompt, see assumptions). Slack redeliveries and email retries do not duplicate anything.
+- **Honest errors**: every tool returns `status` of `ok`, `empty`, `auth_error`, `request_error`, `bad_response`, `unsupported`, `not_configured` or `dry_run`. A broken key is never reported as "not found".
+- **Cost control**: Pitchbook fetches only investors + deals (bio is opt-in); Specter and Pitchbook results are cached per domain (`FUNNEL_CACHE_TTL_HOURS`).
+- **Dry run**: `FUNNEL_DRY_RUN=true` reads everything and writes nothing.
 
 ## Setup
 
@@ -36,20 +30,27 @@ cp .env.example .env   # fill in keys
 python3 -m pytest
 ```
 
-Slack app: Socket Mode on; bot scopes `channels:history`, `groups:history` (private channel), `chat:write`, `app_mentions:read`, `users:read`, `users:read.email` (to map the poster to an Affinity owner); subscribe to `message.channels`/`message.groups` and `app_mention`; invite the bot to the channel. Pause the old zaps before starting the bot or both will reply.
+**Slack app**: Socket Mode on; bot scopes `channels:history` (`groups:history` if private), `chat:write`, `app_mentions:read`, `users:read`, `users:read.email`, `files:read`; subscribe to `message.channels`/`message.groups` and `app_mention`; invite the bot to the channel. Pause the old zaps first or both will reply.
 
-Try it without Slack (reads only):
+**Email via Microsoft Graph (preferred)**: register an Azure app, grant *application* permission `Mail.ReadWrite`, then have IT restrict it to the `qed.topfunnel@` mailbox with an Exchange application access policy (otherwise the app can read every mailbox). Set `MS_TENANT_ID`, `MS_CLIENT_ID`, `MS_CLIENT_SECRET`. The bot polls the inbox, processes unread mail, then marks it read. Failures are retried 3 times, then an error is posted in the channel and the email is marked read.
+
+**Email via webhook (fallback)**: set `FUNNEL_WEBHOOK_PORT` and `FUNNEL_WEBHOOK_SECRET`; have a Zap (or anything) POST to `/inbound/email` with header `X-Funnel-Secret` and JSON `{from, subject, body, attachments:[{filename, content_type, content_base64}]}`. Put it behind HTTPS.
+
+Try it without Slack:
 
 ```bash
-python3 -m funnel.cli "check out https://example.com" --dry-run
+python3 -m funnel.cli "check out https://example.com, cc Sam" --dry-run
+python3 -m funnel.cli "fwd: Acme intro" --email-from "Pat <pat@qedinvestors.com>" --pdf deck.pdf --dry-run
 python3 -m funnel.app   # run the bot
 ```
 
 ## Unverified assumptions (check with live keys)
 
-- Affinity: v1 REST with Basic auth (blank user); interactions return metadata only (date, subject, people), not email bodies.
-- Specter: endpoint/auth in `tools/specter.py` follow the public enrichment API but were not tested.
-- Pitchbook: search still uses `www.<domain>` as the old zap did.
-- Pipeline columns are matched by name (`Stage`, `Owners`); dropdown values are written as option ids and person columns as person ids per Affinity v1 field-values. Confirm against your list.
-- Contacts are attached to the company, which is my reading of the old 'find person by email' loop; tell me if it did something else.
-- Bot only reads top-level channel messages; replies in threads need an `@mention`.
+- **Affinity** v1 REST, Basic auth with blank user. Interactions return metadata, not email bodies. Internal teammates are `type == 1` in `/persons`. File listing/download/upload use `/entity-files`. Pipeline columns are matched by name (`Stage`, `Owners`) and must contain a `Watchlist` option; otherwise the agent reports the error instead of guessing.
+- **Pitchbook**: `/companies/{id}/deals` is assumed to exist next to `/investors`; the response field names are not hard-coded, the model reads them.
+- **Specter**: the endpoint in `tools/specter.py` follows the public enrichment API but is untested. It returns the whole record per call, so it is cached; once you see the real response and pricing, narrow it.
+- **Stage rule**: "set Watchlist only if newly added" is enforced by the prompt, not code.
+- **Web search** uses Anthropic's server-side `web_search` tool (`FUNNEL_WEB_SEARCH_TOOL` if the tool version changes).
+- Emailed results post in the Slack channel naming the forwarder (not by email reply).
+- Scanned or image-only PDFs are read visually by Claude, but the Affinity file reader (`affinity_read_file`) needs extractable text.
+- Slack thread replies are only handled via `@mention`.

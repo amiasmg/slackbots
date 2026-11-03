@@ -1,17 +1,23 @@
-"""Slack entrypoint (Socket Mode). Run: python3 -m funnel.app"""
+"""Entrypoint: Slack (Socket Mode) + optional Graph mailbox poller + optional webhook.
+Run: python3 -m funnel.app"""
 import logging
 import re
+import threading
 
 import anthropic
+import requests
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from .agent import run_agent
 from .config import load_config
+from .intake import graphmail, webhook
+from .models import Attachment, Inbound
 from .tools.urls import extract_company_urls
 
 log = logging.getLogger("funnel")
 SKIP_SUBTYPES = {"message_changed", "message_deleted", "channel_join", "channel_leave"}
+MAX_SLACK_FILE = 25_000_000
 
 
 def build_app(cfg, client=None):
@@ -21,28 +27,55 @@ def build_app(cfg, client=None):
     my_user, my_bot = me["user_id"], me.get("bot_id")
     seen = set()  # Slack can redeliver events
 
-    def poster_of(user_id):
-        """'Name <email>' for the Slack author, so the agent can map them to an Affinity person."""
-        if not user_id:
-            return "(bot/integration - no owner)"
+    def person(user_id):
+        """'Name <email>' for a Slack user (needs users:read + users:read.email); degrades gracefully."""
         try:
-            prof = app.client.users_info(user=user_id)["user"]
-            return f"{prof.get('real_name') or prof.get('name')} <{prof.get('profile', {}).get('email', 'no email')}>"
-        except Exception as exc:  # missing users:read.email scope etc. - degrade, don't fail
-            log.warning("could not resolve poster %s: %s", user_id, exc)
-            return "(unknown poster - no owner)"
+            u = app.client.users_info(user=user_id)["user"]
+            return f"{u.get('real_name') or u.get('name')} <{u.get('profile', {}).get('email', 'no email')}>"
+        except Exception as exc:
+            log.warning("could not resolve Slack user %s: %s", user_id, exc)
+            return ""
 
-    def handle(text, channel, thread_ts, context="", poster=""):
+    def poster_of(user_id):
+        return person(user_id) if user_id else "(bot/integration)"
+
+    def resolve_mentions(text):
+        """Turn <@U123> into 'Name <email>' so 'cc <@U123>' can become an Affinity owner."""
+        return re.sub(r"<@(\w+)>", lambda m: person(m.group(1)) or m.group(0), text)
+
+    def slack_attachments(event):
+        out = []
+        for f in event.get("files") or []:
+            if f.get("size", 0) > MAX_SLACK_FILE or not f.get("url_private_download"):
+                continue
+            try:
+                r = requests.get(f["url_private_download"], timeout=60,
+                                 headers={"Authorization": f"Bearer {cfg.slack_bot_token}"})
+                r.raise_for_status()
+                out.append(Attachment(f.get("name", "file"), f.get("mimetype", ""), r.content))
+            except requests.RequestException as exc:  # needs files:read scope
+                log.warning("could not download Slack file %s: %s", f.get("name"), exc)
+        return out
+
+    def process(item: Inbound, thread_ts=None) -> bool:
+        """Run the agent and post the result. Returns False on failure (after posting an error)."""
         try:
-            result = run_agent(llm, cfg, text, extract_company_urls(text), context, poster)
-            log.info("tools=%s", result.tool_calls)
-            if not result.silent:
-                app.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=result.text)
+            hints = extract_company_urls(item.text)
+            result = run_agent(llm, cfg, item, hints)
+            log.info("%s tools=%s", item.source, result.tool_calls)
+            if result.silent:
+                return True
+            text = result.text
+            if item.source == "email":
+                text = f"📧 Forwarded by {item.sender or 'unknown'}: *{item.subject or '(no subject)'}*\n{text}"
+            app.client.chat_postMessage(channel=cfg.channel, thread_ts=thread_ts, text=text)
+            return True
         except Exception as exc:
             log.exception("agent failed")
             app.client.chat_postMessage(
-                channel=channel, thread_ts=thread_ts,
-                text=f"⚠️ Pipeline agent failed: {type(exc).__name__}: {exc}")
+                channel=cfg.channel, thread_ts=thread_ts,
+                text=f"⚠️ Pipeline agent failed on '{item.subject or item.text[:60]}': {type(exc).__name__}: {exc}")
+            return False
 
     @app.event("message")
     def on_message(event):
@@ -54,23 +87,43 @@ def build_app(cfg, client=None):
         if event.get("thread_ts") not in (None, ts) or (event["channel"], ts) in seen:
             return  # thread replies are handled via @mention
         seen.add((event["channel"], ts))
-        handle(event.get("text", ""), event["channel"], ts, poster=poster_of(event.get("user")))
+        process(Inbound("slack", resolve_mentions(event.get("text", "")), poster_of(event.get("user")),
+                        attachments=slack_attachments(event)), thread_ts=ts)
 
     @app.event("app_mention")
     def on_mention(event):
         thread = event.get("thread_ts") or event["ts"]
         replies = app.client.conversations_replies(channel=event["channel"], ts=thread, limit=20)
         context = "\n".join(m.get("text", "") for m in replies.get("messages", []) if m["ts"] != event["ts"])
-        text = re.sub(rf"<@{my_user}>", "", event.get("text", "")).strip()
-        handle(text, event["channel"], thread, context, poster_of(event.get("user")))
+        text = resolve_mentions(re.sub(rf"<@{my_user}>", "", event.get("text", "")).strip())
+        item = Inbound("slack", text, poster_of(event.get("user")), attachments=slack_attachments(event))
+        hints = extract_company_urls(text + "\n" + context)
+        try:
+            result = run_agent(llm, cfg, item, hints, context)
+            if not result.silent:
+                app.client.chat_postMessage(channel=event["channel"], thread_ts=thread, text=result.text)
+        except Exception as exc:
+            log.exception("agent failed")
+            app.client.chat_postMessage(channel=event["channel"], thread_ts=thread,
+                                        text=f"⚠️ Pipeline agent failed: {type(exc).__name__}: {exc}")
 
+    app.funnel_process = process  # for the email adapters
     return app
 
 
 def main():
     logging.basicConfig(level=logging.INFO)
     cfg = load_config()
-    SocketModeHandler(build_app(cfg), cfg.slack_app_token).start()
+    app = build_app(cfg)
+    stop = threading.Event()
+    if cfg.graph_enabled:
+        threading.Thread(target=graphmail.run_forever, args=(cfg, app.funnel_process, stop), daemon=True).start()
+        log.info("polling %s every %ds", cfg.mailbox, cfg.mail_poll_seconds)
+    else:
+        log.info("Graph not configured (MS_TENANT_ID/MS_CLIENT_ID/MS_CLIENT_SECRET): email via webhook only")
+    if cfg.webhook_port:
+        threading.Thread(target=webhook.serve, args=(cfg, app.funnel_process), daemon=True).start()
+    SocketModeHandler(app, cfg.slack_app_token).start()
 
 
 if __name__ == "__main__":
