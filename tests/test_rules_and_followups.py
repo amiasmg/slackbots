@@ -147,3 +147,12 @@ def test_chatter_in_our_thread_stays_silent_and_mention_not_double_handled(monke
     app2.thread = [{"ts": "2", "text": "summary", "bot_id": "BBOT"}]
     on_message2({"channel": "C1", "ts": "4", "thread_ts": "1", "user": "U1", "text": "<@UBOT> add Sam"})
     assert not app2.posted  # left to the app_mention event, so it is not answered twice
+
+
+def test_webhook_port_falls_back_to_heroku_port(monkeypatch):
+    from funnel.config import load_config
+    monkeypatch.delenv("FUNNEL_WEBHOOK_PORT", raising=False)
+    monkeypatch.setenv("PORT", "5123")
+    assert load_config().webhook_port == 5123
+    monkeypatch.setenv("FUNNEL_WEBHOOK_PORT", "8080")
+    assert load_config().webhook_port == 8080

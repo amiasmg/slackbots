@@ -63,7 +63,8 @@ def load_config() -> Config:
         ms_client_secret=env("MS_CLIENT_SECRET", ""),
         mailbox=env("FUNNEL_MAILBOX", "qed.topfunnel@qedinvestors.com"),
         mail_poll_seconds=int(env("FUNNEL_MAIL_POLL_SECONDS", "60") or 60),
-        webhook_port=int(env("FUNNEL_WEBHOOK_PORT", "0") or 0),
+        # Heroku-style hosts hand us the port to bind as PORT; FUNNEL_WEBHOOK_PORT wins if both are set
+        webhook_port=int(env("FUNNEL_WEBHOOK_PORT") or env("PORT") or 0),
         webhook_secret=env("FUNNEL_WEBHOOK_SECRET", ""),
         dry_run=env("FUNNEL_DRY_RUN", "").lower() in ("1", "true", "yes"),
     )

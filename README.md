@@ -65,6 +65,20 @@ A Zap feeds it: trigger *Microsoft Outlook > New Email* on `qed.topfunnel@`, act
 
 Attachments can be plain file URLs (what Zapier provides), `{filename, url}`, or `{filename, content_type, content_base64}`. URLs must be https and public. A file that cannot be downloaded is reported in the Slack summary instead of being dropped. The Zap must be able to read that mailbox (connect it as, or with delegated access to, `qed.topfunnel@`).
 
+**Hosting on Heroku**: the repo includes a `Procfile` and `.python-version`, so no Docker is needed. Heroku sets `PORT` and the bot binds to it automatically, and gives you an `https://<app>.herokuapp.com` URL (use `https://<app>.herokuapp.com/inbound/email` in the Zap). Run **exactly one** dyno, on **Basic or higher**: Eco dynos sleep after 30 minutes without web traffic, which silently stops the Slack connection.
+
+```bash
+heroku login
+heroku create <app-name>
+heroku ps:type web=basic
+# Settings > Config Vars in the dashboard: add every variable from .env (except FUNNEL_WEBHOOK_PORT)
+git push heroku claude/trusting-cori-9bv9v5:main      # or connect the GitHub repo/branch in the Deploy tab
+heroku ps:scale web=1
+heroku logs --tail
+```
+
+The dyno's disk is wiped on every restart, so the Specter/Pitchbook cache starts empty after one (it only costs a few repeat lookups).
+
 *Alternative, needs IT*: Microsoft Graph polling (`MS_TENANT_ID`, `MS_CLIENT_ID`, `MS_CLIENT_SECRET`) with an Azure app that has application permission `Mail.ReadWrite`, restricted to that one mailbox by an Exchange application access policy (otherwise it can read every mailbox). If Graph is configured, both run.
 
 Try it without Slack:
