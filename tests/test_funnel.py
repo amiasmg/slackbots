@@ -117,13 +117,13 @@ def test_set_stage_resolves_dropdown_text_and_replaces(monkeypatch):
     calls = patch_requests(monkeypatch, _routes_with_list({
         ("GET", "/field-values"): FakeResp(200, [{"id": 99, "field_id": 1, "value": {"id": 11}}]),
         ("PUT", "/field-values/99"): FakeResp(200, {})}))
-    out = affinity.affinity_set_list_entry_field(CFG, 3, 5, "stage", "Diligence")
+    out = affinity._set_field(CFG, 3, 5, "stage", "Diligence")
     assert out["changed"] and ("PUT", "https://api.affinity.co/field-values/99") in calls
 
 
 def test_set_stage_rejects_unknown_option(monkeypatch):
     patch_requests(monkeypatch, _routes_with_list())
-    out = affinity.affinity_set_list_entry_field(CFG, 3, 5, "Stage", "Nonsense")
+    out = affinity._set_field(CFG, 3, 5, "Stage", "Nonsense")
     assert out["status"] == "request_error" and "Intro" in out["message"]
 
 

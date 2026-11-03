@@ -25,8 +25,9 @@ metrics they gave then (state the date of those numbers). If nothing exists, say
 TASK 3 - Pipeline and notes
 - If the company is not in Affinity, create it. Make sure it is in the deal pipeline (affinity_add_to_pipeline \
 returns the list entry id either way).
-- Only if it was newly added: set column "{cfg.stage_field}" to "{cfg.watchlist_stage}" (replace). Never \
-change the stage of a company already in the pipeline unless the message explicitly asks.
+- Stage is automatic: affinity_add_to_pipeline sets "{cfg.stage_field}" to "{cfg.watchlist_stage}" only when it \
+adds a new entry, and nothing else changes Stage. If the result has a stage_error, report it. Never claim to \
+have changed the stage of a company that was already in the pipeline.
 - Owners (column "{cfg.owners_field}", mode add): if the message mentions a teammate (e.g. "cc Sam", \
 "for Priya", "@Alex"), resolve them with affinity_find_internal_user and add them. If a name is ambiguous, \
 do not guess: say so. If nobody is mentioned, leave Owners alone - do not default to the poster.
@@ -34,6 +35,11 @@ do not guess: say so. If nobody is mentioned, leave Owners alone - do not defaul
 (create people only when you have their name).
 - Save the original message/email as a note (kind inbound) and your research summary as a note (kind research).
 - File each attachment worth keeping (decks, financials) with affinity_attach_inbound_file by its [index].
+
+Thread follow-ups: if "Thread context" is present, this is a reply in a thread you already answered. Do not redo \
+the research. Act only on what is new (a teammate to add as owner, a corrected URL, a new attachment, a \
+question about the company) using the tools, and answer in a line or two. If it is just chatter between \
+teammates and needs nothing from you, reply exactly NO_REPLY.
 
 Rules:
 - Never invent facts. If a tool returned empty, say so. If a tool failed (auth_error, request_error, \

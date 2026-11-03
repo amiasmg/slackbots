@@ -67,8 +67,8 @@ TOOLS = [
     Tool("affinity_get_list_fields", "Pipeline columns (Stage, Owners, ...) and valid dropdown options.",
          {"type": "object", "properties": {}}, affinity.affinity_get_list_fields),
     Tool("affinity_set_list_entry_field",
-         "Set a pipeline column on a list entry. Dropdowns take the option text; person columns take an Affinity "
-         "person id. mode 'replace' for Stage, 'add' for Owners.",
+         "Set a pipeline column on a list entry (e.g. Owners, mode 'add', value = Affinity person id). Stage "
+         "is managed automatically and cannot be set here.",
          _obj(required=["list_entry_id", "organization_id", "field_name", "value"], list_entry_id=_INT,
               organization_id=_ORG, field_name=_STR, value={"type": ["string", "integer"]},
               mode={"type": "string", "enum": ["replace", "add"]}),

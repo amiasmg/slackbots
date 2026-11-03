@@ -65,6 +65,7 @@ def run_agent(client, cfg: Config, item, url_hints=(), context: str = "") -> Age
     messages = [{"role": "user", "content": _first_message(item, url_hints, context)}]
     tools = [t.spec() for t in TOOLS] + [{"type": cfg.web_search_tool, "name": "web_search", "max_uses": 6}]
     system, log = build_system(cfg), []
+    pdf_budget = MAX_PDF_BYTES - sum(len(a.data) for a in item.attachments if a.is_pdf)
 
     for _ in range(MAX_TURNS):
         resp = client.messages.create(model=cfg.model, max_tokens=4096, system=system,
@@ -76,13 +77,23 @@ def run_agent(client, cfg: Config, item, url_hints=(), context: str = "") -> Age
             text = "".join(b.text for b in resp.content if b.type == "text")
             return AgentResult(text=text, tool_calls=log)
         messages.append({"role": "assistant", "content": resp.content})
-        results = []
+        results, extras = [], []
         for block in resp.content:
             if block.type != "tool_use":
                 continue
             out = execute(cfg, block.name, dict(block.input), item)
+            pdf = out.pop("_pdf", None)  # raw bytes never go through JSON
+            if pdf is not None:
+                if len(pdf) <= pdf_budget:
+                    pdf_budget -= len(pdf)
+                    extras.append({"type": "document", "title": f"{block.name} result", "source": {
+                        "type": "base64", "media_type": "application/pdf",
+                        "data": base64.standard_b64encode(pdf).decode()}})
+                else:
+                    out = {"status": "unsupported", "message": "Scanned PDF too large to attach"}
             log.append({"tool": block.name, "input": dict(block.input), "status": out.get("status")})
             results.append({"type": "tool_result", "tool_use_id": block.id, "content": _serialize(out)})
-        messages.append({"role": "user", "content": results})
+        # documents ride in the same user turn, after the tool_result blocks
+        messages.append({"role": "user", "content": results + extras})
     return AgentResult(text="⚠️ Agent hit its step limit before finishing; partial work may have been done.",
                        tool_calls=log)

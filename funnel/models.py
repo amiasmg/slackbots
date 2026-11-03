@@ -9,7 +9,8 @@ class Attachment:
 
     @property
     def is_pdf(self) -> bool:
-        return self.content_type == "application/pdf" or self.filename.lower().endswith(".pdf")
+        return (self.content_type == "application/pdf" or self.filename.lower().endswith(".pdf")
+                or self.data[:4] == b"%PDF")
 
 
 @dataclass

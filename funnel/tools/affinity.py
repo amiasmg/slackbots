@@ -89,12 +89,20 @@ def affinity_add_to_pipeline(cfg, organization_id: int) -> dict:
     if entry:
         return ok(added=False, already_in_pipeline=True, list_entry_id=entry.get("id"))
     if cfg.dry_run:
-        return {"status": "dry_run", "message": f"Would add organization {organization_id} to list {cfg.affinity_list_id}"}
+        return {"status": "dry_run", "message": f"Would add organization {organization_id} to list "
+                f"{cfg.affinity_list_id} with {cfg.stage_field}={cfg.watchlist_stage}"}
     res = api_call("Affinity", "POST", f"{BASE}/lists/{cfg.affinity_list_id}/list-entries",
                    json={"entity_id": organization_id}, auth=_auth(cfg))
     if res["status"] != "ok":
         return res
-    return ok(added=True, list_entry_id=res["data"].get("id"))
+    entry_id = res["data"].get("id")
+    # Stage rule lives here, not in the prompt: only a brand-new entry gets Watchlist.
+    stage = _set_field(cfg, entry_id, organization_id, cfg.stage_field, cfg.watchlist_stage, "replace")
+    out = ok(added=True, list_entry_id=entry_id,
+             stage=cfg.watchlist_stage if stage["status"] == "ok" else None)
+    if stage["status"] != "ok":
+        out["stage_error"] = stage  # entry exists but Stage was not set: surface it, don't hide it
+    return out
 
 
 def affinity_get_notes(cfg, organization_id: int) -> dict:
@@ -237,8 +245,8 @@ def _plain(v):
     return v.get("id") if isinstance(v, dict) else v
 
 
-def affinity_set_list_entry_field(cfg, list_entry_id: int, organization_id: int,
-                                  field_name: str, value, mode: str = "replace") -> dict:
+def _set_field(cfg, list_entry_id: int, organization_id: int,
+               field_name: str, value, mode: str = "replace") -> dict:
     """Set a pipeline column. Dropdowns take the option text; person columns take a person id.
     mode 'replace' overwrites a single value (Stage); 'add' appends without removing (Owners)."""
     if (e := _check(cfg)):
@@ -365,7 +373,12 @@ def affinity_read_file(cfg, file_id: int, name: str = "") -> dict:
     res = api_call("Affinity", "GET", f"{BASE}/entity-files/download/{file_id}", auth=_auth(cfg), raw=True)
     if res["status"] != "ok":
         return res
-    return _extract_text(res["content"], res["content_type"], name)
+    out = _extract_text(res["content"], res["content_type"], name)
+    if out["status"] == "empty" and res["content"][:4] == b"%PDF":
+        # Scanned/image-only: the agent loop attaches the bytes so the model can read it visually.
+        return ok(needs_vision=True, _pdf=res["content"],
+                  message="No text layer; the PDF is attached to the next message for you to read")
+    return out
 
 
 def affinity_attach_inbound_file(cfg, ctx, organization_id: int, attachment_index: int) -> dict:
@@ -389,3 +402,13 @@ def affinity_attach_inbound_file(cfg, ctx, organization_id: int, attachment_inde
                    data={"organization_id": organization_id},
                    files={"file": (att.filename, att.data, att.content_type)})
     return ok(uploaded=True, filename=att.filename) if res["status"] == "ok" else res
+
+
+def affinity_set_list_entry_field(cfg, list_entry_id: int, organization_id: int,
+                                  field_name: str, value, mode: str = "replace") -> dict:
+    """Agent-facing pipeline column setter. Stage is deliberately off-limits: add_to_pipeline sets it
+    to Watchlist on creation and nothing else changes it."""
+    if field_name.strip().lower() == cfg.stage_field.lower():
+        return error("request_error", f"{cfg.stage_field} cannot be changed here; it is set to "
+                     f"'{cfg.watchlist_stage}' automatically when a company is first added")
+    return _set_field(cfg, list_entry_id, organization_id, field_name, value, mode)

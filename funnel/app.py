@@ -77,35 +77,60 @@ def build_app(cfg, client=None):
                 text=f"⚠️ Pipeline agent failed on '{item.subject or item.text[:60]}': {type(exc).__name__}: {exc}")
             return False
 
-    @app.event("message")
-    def on_message(event):
-        if event.get("channel") != cfg.channel or event.get("subtype") in SKIP_SUBTYPES:
-            return
-        if event.get("user") == my_user or (my_bot and event.get("bot_id") == my_bot):
-            return  # never react to ourselves
-        ts = event["ts"]
-        if event.get("thread_ts") not in (None, ts) or (event["channel"], ts) in seen:
-            return  # thread replies are handled via @mention
-        seen.add((event["channel"], ts))
-        process(Inbound("slack", resolve_mentions(event.get("text", "")), poster_of(event.get("user")),
-                        attachments=slack_attachments(event)), thread_ts=ts)
+    our_threads = set()  # threads we have replied in (rebuilt lazily after a restart)
 
-    @app.event("app_mention")
-    def on_mention(event):
-        thread = event.get("thread_ts") or event["ts"]
-        replies = app.client.conversations_replies(channel=event["channel"], ts=thread, limit=20)
-        context = "\n".join(m.get("text", "") for m in replies.get("messages", []) if m["ts"] != event["ts"])
+    def is_ours(m):
+        return m.get("user") == my_user or (my_bot and m.get("bot_id") == my_bot)
+
+    def thread_messages(channel, thread):
+        return app.client.conversations_replies(channel=channel, ts=thread, limit=30).get("messages", [])
+
+    def follow_up(event, thread):
+        """Reply in a thread: answer new instructions/questions, stay silent on chatter (NO_REPLY)."""
+        msgs = thread_messages(event["channel"], thread)
+        context = "\n".join(m.get("text", "") for m in msgs if m["ts"] != event["ts"])
         text = resolve_mentions(re.sub(rf"<@{my_user}>", "", event.get("text", "")).strip())
         item = Inbound("slack", text, poster_of(event.get("user")), attachments=slack_attachments(event))
-        hints = extract_company_urls(text + "\n" + context)
         try:
-            result = run_agent(llm, cfg, item, hints, context)
+            result = run_agent(llm, cfg, item, extract_company_urls(text + "\n" + context), context or "(thread)")
+            log.info("followup tools=%s", result.tool_calls)
             if not result.silent:
                 app.client.chat_postMessage(channel=event["channel"], thread_ts=thread, text=result.text)
         except Exception as exc:
             log.exception("agent failed")
             app.client.chat_postMessage(channel=event["channel"], thread_ts=thread,
                                         text=f"⚠️ Pipeline agent failed: {type(exc).__name__}: {exc}")
+
+    @app.event("message")
+    def on_message(event):
+        if event.get("channel") != cfg.channel or event.get("subtype") in SKIP_SUBTYPES:
+            return
+        if is_ours(event):
+            return  # never react to ourselves
+        ts = event["ts"]
+        if (event["channel"], ts) in seen:
+            return
+        thread = event.get("thread_ts")
+        if thread not in (None, ts):  # a reply inside a thread
+            if f"<@{my_user}>" in event.get("text", ""):
+                return  # on_mention handles explicit mentions
+            if thread not in our_threads:
+                if not any(is_ours(m) for m in thread_messages(event["channel"], thread)):
+                    return  # not a conversation we took part in: leave humans alone
+                our_threads.add(thread)
+            seen.add((event["channel"], ts))
+            return follow_up(event, thread)
+        seen.add((event["channel"], ts))
+        if process(Inbound("slack", resolve_mentions(event.get("text", "")), poster_of(event.get("user")),
+                           attachments=slack_attachments(event)), thread_ts=ts):
+            our_threads.add(ts)
+
+    @app.event("app_mention")
+    def on_mention(event):
+        if (event["channel"], event["ts"]) in seen:
+            return
+        seen.add((event["channel"], event["ts"]))
+        follow_up(event, event.get("thread_ts") or event["ts"])
 
     app.funnel_process = process  # for the email adapters
     return app
