@@ -24,7 +24,7 @@ def _fetch(cfg, domain: str) -> dict:
     data = res["data"]
     rows = data if isinstance(data, list) else data.get("results") if isinstance(data, dict) else None
     if rows is None:
-        return error("bad_response", "Specter response was neither a list nor {'results': [...]}")
+        return error("bad_response", f"Specter response was neither a list nor {{'results': [...]}}: {data}")
     if not rows:
         return empty(f"Specter has no company matching {domain}")
     return ok(company=rows[0])
